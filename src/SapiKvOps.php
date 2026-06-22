@@ -66,6 +66,14 @@ final class SapiKvOps implements KvOpsInterface
 
     public function flush(): bool
     {
+        // ephpm_kv_flush_all() was added after the original SAPI surface
+        // (ePHPm v0.1.2). Guard it so the drop-in still works on older
+        // runtimes: flush is simply unavailable there (wp_cache_flush()
+        // returns false and entries age out via TTL) rather than fataling
+        // the request with "Call to undefined function".
+        if (!\function_exists('ephpm_kv_flush_all')) {
+            return false;
+        }
         return (bool) \ephpm_kv_flush_all();
     }
 }
