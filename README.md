@@ -49,7 +49,10 @@ rather than being a documented no-op.
   This package does **not** depend on any WordPress core Composer package — it
   implements the `WP_Object_Cache` surface WordPress calls, and runs its tests
   on plain `php-cli`.
-- **The ePHPm runtime** — the global `ephpm_kv_*` SAPI functions are registered
+- **The ePHPm runtime, v0.1.2 or newer** (current release: v0.8.6). The
+  `ephpm_kv_*` SAPI functions have shipped since ePHPm v0.1.0, but
+  `ephpm_kv_flush_all()` — which backs `wp_cache_flush()` — arrived in v0.1.2.
+  The functions are registered
   by ePHPm's embedded PHP. If you run WordPress under PHP-FPM, Apache mod_php, or
   the stock PHP CLI, those functions don't exist and `SapiKvOps::__construct()`
   throws. The drop-in degrades gracefully in that case (see
@@ -68,8 +71,13 @@ If you get `false`, you're not running inside ePHPm.
 
 ## Install
 
+ePHPm packages are distributed via their GitHub repositories, not Packagist.
+Add this repo as a Composer `vcs` repository, then require the package
+(`ephpm/cache-wordpress` is tagged `v0.1.0`, so `^0.1` resolves):
+
 ```bash
-composer require ephpm/cache-wordpress
+composer config repositories.ephpm/cache-wordpress vcs https://github.com/ephpm/cache-wordpress
+composer require ephpm/cache-wordpress:^0.1
 ```
 
 Then activate the drop-in by copying it into `wp-content/`:
@@ -167,12 +175,11 @@ actually cleared.
 ## `wp_cache_flush()` actually works
 
 Most object-cache drop-ins that sit on a key/value store with no `SCAN` or
-`FLUSHALL` have to make `wp_cache_flush()` a no-op (the sibling
-`ephpm/cache-laravel` store, for instance, returns `false` from `flush()` and
-documents the "bump the prefix" workaround).
-
-This package doesn't have that problem. ePHPm's KV SAPI exposes
-`ephpm_kv_flush_all()`, which clears the entire effective store in one call.
+`FLUSHALL` have to make `wp_cache_flush()` a no-op. This package doesn't have
+that problem — and neither does the sibling `ephpm/cache-laravel` store, whose
+`Cache::flush()` goes through the same mechanism. ePHPm's KV SAPI exposes
+`ephpm_kv_flush_all()` (since v0.1.2), which clears the entire effective store
+in one call.
 `wp_cache_flush()` clears both the runtime array and the persistent store, so
 plugins and `wp cache flush` behave exactly as WordPress expects.
 
