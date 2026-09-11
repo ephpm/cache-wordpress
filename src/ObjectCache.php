@@ -146,10 +146,40 @@ final class ObjectCache
         if (\function_exists('wp_suspend_cache_addition') && \wp_suspend_cache_addition()) {
             return false;
         }
-        if ($this->existsInRuntime($key, $group) || $this->existsInStore($key, $group)) {
+
+        // A value already materialised in this request's runtime array always
+        // loses the race locally — this mirrors WP core's own `_exists()`
+        // short-circuit and avoids a needless store round-trip.
+        if ($this->existsInRuntime($key, $group)) {
             return false;
         }
-        return $this->set($key, $data, $group, $ttl);
+
+        // Non-persistent groups live only in the runtime array; there is no
+        // shared store to race against, so a plain check-then-set is correct
+        // and keeps the "never touches the backend" guarantee.
+        if ($this->isNonPersistent($group)) {
+            return $this->set($key, $data, $group, $ttl);
+        }
+
+        // Persistent path: `setnx` is the atomic add primitive — a single
+        // insert-if-absent under the KV store's per-shard lock. Two concurrent
+        // add()s therefore cannot both win, which WordPress depends on
+        // (`wp_cache_add()` is used as a cron/lock mutex). The old
+        // check-then-set (`exists()` then `set()`) was a race: both callers
+        // could observe "absent" and both write.
+        if (\is_object($data)) {
+            $data = clone $data;
+        }
+        $inserted = $this->ops->setnx(
+            $this->build_key($key, $group),
+            $this->serialize($data),
+            \max(0, $ttl),
+        );
+        if (!$inserted) {
+            return false;
+        }
+        $this->cache[$group][(string) $key] = $data;
+        return true;
     }
 
     /**
@@ -243,15 +273,25 @@ final class ObjectCache
         }
         $skey = (string) $key;
 
+        // Non-persistent groups live ONLY in the runtime array — there is no
+        // persistent tier behind them. `$force` bypasses the local cache only
+        // to re-read the shared store, so for a runtime-only group a forced
+        // read must still serve the runtime value (never fall through to the
+        // store, which would spuriously miss).
+        if ($this->isNonPersistent($group)) {
+            if (isset($this->cache[$group]) && \array_key_exists($skey, $this->cache[$group])) {
+                $found = true;
+                $value = $this->cache[$group][$skey];
+                return \is_object($value) ? clone $value : $value;
+            }
+            $found = false;
+            return false;
+        }
+
         if (!$force && isset($this->cache[$group]) && \array_key_exists($skey, $this->cache[$group])) {
             $found = true;
             $value = $this->cache[$group][$skey];
             return \is_object($value) ? clone $value : $value;
-        }
-
-        if ($this->isNonPersistent($group)) {
-            $found = false;
-            return false;
         }
 
         $raw = $this->ops->get($this->build_key($key, $group));
@@ -331,6 +371,14 @@ final class ObjectCache
 
         if ($this->isNonPersistent($group)) {
             return $this->incrRuntime($key, $offset, $group);
+        }
+
+        // WordPress core semantics: incr/decr on a MISSING key returns false —
+        // it does not create the key. The raw KV SAPI's incr_by would instead
+        // create it at the delta (INCR on a missing key => the delta), so gate
+        // on existence in the store first and only then increment.
+        if (!$this->existsInStore($key, $group)) {
+            return false;
         }
 
         try {
@@ -455,7 +503,13 @@ final class ObjectCache
     private function incrRuntime($key, int $offset, string $group): int|false
     {
         $skey = (string) $key;
-        $current = $this->cache[$group][$skey] ?? 0;
+        // Match WP core: incr/decr on a missing key returns false rather than
+        // creating it at the delta. (This is the runtime-only counterpart of
+        // the existsInStore() gate on the persistent path.)
+        if (!$this->existsInRuntime($key, $group)) {
+            return false;
+        }
+        $current = $this->cache[$group][$skey];
         if (!\is_numeric($current)) {
             return false;
         }

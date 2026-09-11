@@ -34,6 +34,11 @@ final class SapiKvOps implements KvOpsInterface
         return (bool) \ephpm_kv_set($key, $value, $ttlSeconds);
     }
 
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool
+    {
+        return (bool) \ephpm_kv_setnx($key, $value, $ttlSeconds);
+    }
+
     public function del(string $key): int
     {
         return (int) \ephpm_kv_del($key);
@@ -46,7 +51,15 @@ final class SapiKvOps implements KvOpsInterface
 
     public function incrBy(string $key, int $delta): int
     {
-        return (int) \ephpm_kv_incr_by($key, $delta);
+        // ephpm_kv_incr_by returns `false` when the stored value is not an
+        // integer. A bare `(int) false === 0` would silently mask that as a
+        // legitimate zero result, so capture and distinguish it: the
+        // interface documents this method as throwing on a non-integer value.
+        $result = \ephpm_kv_incr_by($key, $delta);
+        if ($result === false) {
+            throw new \RuntimeException("value at key '{$key}' is not an integer");
+        }
+        return (int) $result;
     }
 
     public function expire(string $key, int $ttlSeconds): bool

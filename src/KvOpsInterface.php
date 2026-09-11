@@ -34,6 +34,22 @@ interface KvOpsInterface
     public function set(string $key, string $value, int $ttlSeconds = 0): bool;
 
     /**
+     * Atomically insert a key only if no live entry already exists — the
+     * atomic add primitive.
+     *
+     * Backed by the SAPI's `ephpm_kv_setnx()`, which performs the
+     * insert-if-absent under a per-shard lock, so two concurrent callers can
+     * never both succeed. WordPress relies on `wp_cache_add()` being atomic
+     * (it is used as a cron/lock mutex), which a check-then-set cannot be.
+     *
+     * @param int $ttlSeconds 0 means no expiry; positive values are seconds
+     *
+     * @return bool true if this call inserted the key; false if a live entry
+     *              already existed (or the store rejected the write, e.g. OOM)
+     */
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool;
+
+    /**
      * Delete a key.
      *
      * @return int 1 if the key existed, 0 if it did not

@@ -300,13 +300,19 @@ if (!function_exists('wp_cache_reset')) {
 if (!function_exists('wp_cache_supports')) {
     function wp_cache_supports(string $feature): bool
     {
+        // NOTE: 'flush_group' is deliberately NOT advertised. The KV SAPI has
+        // no key-enumeration or prefix-scan primitive, so a *persistent* group
+        // cannot actually be flushed selectively (see ObjectCache::flush_group,
+        // which returns false for persistent groups). Advertising it would
+        // promise a capability we can only honour for runtime-only groups, so
+        // callers that gate on wp_cache_supports('flush_group') would wrongly
+        // believe the persistent tier was cleared.
         return match ($feature) {
             'add_multiple',
             'set_multiple',
             'get_multiple',
             'delete_multiple',
-            'flush_runtime',
-            'flush_group' => true,
+            'flush_runtime' => true,
             default => false,
         };
     }

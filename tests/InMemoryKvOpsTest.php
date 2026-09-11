@@ -42,6 +42,35 @@ final class InMemoryKvOpsTest extends TestCase
         self::assertFalse($ops->exists('k'));
     }
 
+    public function test_setnx_inserts_only_when_absent(): void
+    {
+        $ops = new InMemoryKvOps();
+        self::assertTrue($ops->setnx('lock', 'a'));
+        self::assertFalse($ops->setnx('lock', 'b'));
+        // The first writer's value is preserved.
+        self::assertSame('a', $ops->get('lock'));
+    }
+
+    public function test_setnx_applies_ttl_on_insert(): void
+    {
+        $ops = new InMemoryKvOps();
+        self::assertTrue($ops->setnx('k', 'v', 30));
+        $pttl = $ops->pttl('k');
+        self::assertGreaterThan(0, $pttl);
+        self::assertLessThanOrEqual(30_000, $pttl);
+    }
+
+    public function test_setnx_succeeds_over_an_expired_key(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->set('k', 'old', 60);
+        // Force the deadline into the past so the key is lazily expired.
+        $ops->expire('k', 1);
+        \usleep(1_100_000);
+        self::assertTrue($ops->setnx('k', 'new'));
+        self::assertSame('new', $ops->get('k'));
+    }
+
     public function test_incr_creates_key_then_accumulates(): void
     {
         $ops = new InMemoryKvOps();
