@@ -63,6 +63,36 @@ final class ObjectCacheTest extends TestCase
         self::assertSame('first', $cache->get('k'));
     }
 
+    public function test_add_is_atomic_via_setnx(): void
+    {
+        // Two independent ObjectCache instances over ONE shared backend model
+        // two concurrent requests/nodes racing wp_cache_add() (which core uses
+        // as a lock/cron mutex). Exactly one add() may win, and the losing
+        // add() must not clobber the winner's value. A check-then-set add()
+        // could let both observe "absent" and both write; setnx cannot.
+        $shared = new InMemoryKvOps();
+        $a = new ObjectCache($shared);
+        $b = new ObjectCache($shared);
+
+        self::assertTrue($a->add('lock', 'owner-a', 'locks'));
+        self::assertFalse($b->add('lock', 'owner-b', 'locks'));
+
+        // The store still holds the winner's value, unchanged.
+        self::assertSame('owner-a', $b->get('lock', 'locks', true));
+        self::assertSame('owner-a', $a->get('lock', 'locks', true));
+    }
+
+    public function test_add_persistent_path_uses_setnx_not_exists_then_set(): void
+    {
+        // Proves the atomic primitive is actually exercised on the persistent
+        // path: a single setnx, with no separate exists()+set() race window.
+        $spy = new SpyKvOps();
+        $cache = new ObjectCache($spy);
+
+        self::assertTrue($cache->add('k', 'v', 'options'));
+        self::assertSame(['setnx'], $spy->calls);
+    }
+
     public function test_replace_only_when_present(): void
     {
         $cache = new ObjectCache(new InMemoryKvOps());
@@ -86,6 +116,8 @@ final class ObjectCacheTest extends TestCase
     public function test_incr_and_decr(): void
     {
         $cache = new ObjectCache(new InMemoryKvOps());
+        // WP core does not create a key on incr(); seed it first.
+        $cache->set('hits', 0);
         self::assertSame(1, $cache->incr('hits'));
         self::assertSame(6, $cache->incr('hits', 5));
         self::assertSame(4, $cache->decr('hits', 2));
@@ -97,6 +129,53 @@ final class ObjectCacheTest extends TestCase
         $cache = new ObjectCache(new InMemoryKvOps());
         $cache->set('label', 'not-a-number');
         self::assertFalse($cache->incr('label'));
+    }
+
+    public function test_incr_on_missing_persistent_key_returns_false(): void
+    {
+        // WP core returns false for incr/decr on a missing key (it does NOT
+        // create-at-delta the way the raw KV SAPI's incr_by would). Nothing
+        // must be written to the store as a side effect.
+        $ops = new InMemoryKvOps();
+        $cache = new ObjectCache($ops);
+
+        self::assertFalse($cache->incr('never-seen'));
+        self::assertFalse($cache->decr('never-seen'));
+        self::assertNull($ops->get($cache->build_key('never-seen')));
+        self::assertFalse($cache->get('never-seen', 'default', true));
+    }
+
+    public function test_incr_on_missing_non_persistent_key_returns_false(): void
+    {
+        $cache = new ObjectCache(new InMemoryKvOps());
+        $cache->add_non_persistent_groups('counts');
+        self::assertFalse($cache->incr('misses', 1, 'counts'));
+    }
+
+    public function test_force_read_of_non_persistent_group_stays_local(): void
+    {
+        // force=true bypasses the local cache only for PERSISTENT groups (to
+        // re-read the shared store). A runtime-only group has no store behind
+        // it, so a forced read must still return the runtime value and never
+        // reach the backend.
+        $spy = new SpyKvOps();
+        $cache = new ObjectCache($spy);
+        $cache->add_non_persistent_groups('counts');
+        $cache->set('comments', 5, 'counts');
+
+        $found = null;
+        self::assertSame(5, $cache->get('comments', 'counts', true, $found));
+        self::assertTrue($found);
+
+        $found = null;
+        self::assertFalse($cache->get('absent', 'counts', true, $found));
+        self::assertFalse($found);
+
+        self::assertSame(
+            [],
+            $spy->calls,
+            'a forced read of a non-persistent group must not touch the backend',
+        );
     }
 
     public function test_get_multiple_and_set_multiple(): void
@@ -275,6 +354,12 @@ final class SpyKvOps implements KvOpsInterface
     {
         $this->calls[] = 'set';
         return $this->inner->set($key, $value, $ttlSeconds);
+    }
+
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool
+    {
+        $this->calls[] = 'setnx';
+        return $this->inner->setnx($key, $value, $ttlSeconds);
     }
 
     public function del(string $key): int

@@ -37,6 +37,18 @@ final class InMemoryKvOps implements KvOpsInterface
         return true;
     }
 
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool
+    {
+        // Insert only when no live entry exists. A key whose deadline has
+        // already passed is treated as absent (lazy expiry via liveValue),
+        // so setnx over an expired key succeeds — matching the SAPI.
+        if ($this->liveValue($key) !== null) {
+            return false;
+        }
+        $this->set($key, $value, $ttlSeconds);
+        return true;
+    }
+
     public function del(string $key): int
     {
         if ($this->liveValue($key) === null) {

@@ -11,7 +11,8 @@ Memcached daemon to run.
 // Anywhere in WordPress, once wp-content/object-cache.php is in place:
 wp_cache_set('user:42', ['name' => 'Alice'], 'users', 3600);
 wp_cache_get('user:42', 'users');     // ['name' => 'Alice']
-wp_cache_incr('hits:home');           // 1
+wp_cache_set('hits:home', 0);         // seed the counter first
+wp_cache_incr('hits:home');           // 1  (incr on a missing key returns false, per WP core)
 wp_cache_flush();                     // really clears the whole store
 ```
 
@@ -49,7 +50,7 @@ rather than being a documented no-op.
   This package does **not** depend on any WordPress core Composer package — it
   implements the `WP_Object_Cache` surface WordPress calls, and runs its tests
   on plain `php-cli`.
-- **The ePHPm runtime, v0.1.2 or newer** (current release: v0.8.6). The
+- **The ePHPm runtime, v0.1.2 or newer** (current release: v0.10.2). The
   `ephpm_kv_*` SAPI functions have shipped since ePHPm v0.1.0, but
   `ephpm_kv_flush_all()` — which backs `wp_cache_flush()` — arrived in v0.1.2.
   The functions are registered
@@ -133,10 +134,10 @@ delegating to the `ObjectCache` engine:
 
 | Function(s)                                            | Backed by ePHPm KV |
 |--------------------------------------------------------|--------------------|
-| `wp_cache_get`, `wp_cache_set`, `wp_cache_add`, `wp_cache_replace` | yes      |
+| `wp_cache_get`, `wp_cache_set`, `wp_cache_add`, `wp_cache_replace` | yes (`add` is atomic via `ephpm_kv_setnx`) |
 | `wp_cache_delete`                                      | yes                |
 | `wp_cache_get_multiple`, `wp_cache_set_multiple`, `wp_cache_add_multiple`, `wp_cache_delete_multiple` | yes |
-| `wp_cache_incr`, `wp_cache_decr`                       | yes (atomic via `ephpm_kv_incr_by`) |
+| `wp_cache_incr`, `wp_cache_decr`                       | yes (atomic via `ephpm_kv_incr_by`; miss returns `false`, per WP core) |
 | `wp_cache_flush`                                       | **yes — clears the whole store** |
 | `wp_cache_flush_runtime`                               | yes (runtime array only) |
 | `wp_cache_flush_group`                                 | partial (see below) |
@@ -147,8 +148,11 @@ delegating to the `ObjectCache` engine:
 | `wp_cache_supports($feature)`                          | yes                |
 
 `wp_cache_supports()` returns `true` for `add_multiple`, `set_multiple`,
-`get_multiple`, `delete_multiple`, `flush_runtime`, and `flush_group`, so core
-and well-behaved plugins take their batched/fast paths.
+`get_multiple`, `delete_multiple`, and `flush_runtime`, so core and well-behaved
+plugins take their batched/fast paths. It returns `false` for `flush_group`:
+the persistent tier cannot be selectively flushed (the KV SAPI has no
+key-enumeration primitive), so advertising it would over-promise — see the
+[`wp_cache_flush_group()` limitation](#wp_cache_flush_group-limitation) below.
 
 Like core's own `WP_Object_Cache`, every value set during a request is served
 back from an in-request runtime array for the rest of that request; the KV store
@@ -319,8 +323,8 @@ ePHPm runs PHP inside the same OS process as the KV store via the embed SAPI. Th
 store itself is a Rust [`DashMap`](https://docs.rs/dashmap/) plus TTL management.
 ePHPm registers a small set of host functions (`ephpm_kv_get`, `ephpm_kv_set`,
 `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`,
-`ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_flush_all`) into PHP's global
-function table. Calling one is a direct C function call into Rust — no socket, no
+`ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_setnx`, `ephpm_kv_flush_all`) into
+PHP's global function table. Calling one is a direct C function call into Rust — no socket, no
 protocol parser, no value serialization beyond what userland code already does.
 
 This package wraps those functions in a `WP_Object_Cache`-shaped engine
