@@ -251,9 +251,40 @@ final class ObjectCache
      */
     public function set_multiple(array $data, string $group = 'default', int $ttl = 0): array
     {
-        $result = [];
+        if ($group === '') {
+            $group = 'default';
+        }
+        if ($this->isNonPersistent($group) || !$this->ops instanceof BatchKvOpsInterface) {
+            $result = [];
+            foreach ($data as $key => $value) {
+                $result[$key] = $this->set($key, $value, $group, $ttl);
+            }
+            return $result;
+        }
+
+        // Batch path: same runtime write-through as set(), then a single
+        // mset for the whole batch (one call into the store on ePHPm
+        // >= v0.13.0 instead of one per key). Every key shares $ttl, which
+        // is exactly what set_multiple() promises.
+        $storeKeys = [];
+        $payload = [];
         foreach ($data as $key => $value) {
-            $result[$key] = $this->set($key, $value, $group, $ttl);
+            if (\is_object($value)) {
+                $value = clone $value;
+            }
+            $this->cache[$group][(string) $key] = $value;
+            $storeKey = $this->build_key($key, $group);
+            $storeKeys[$key] = $storeKey;
+            $payload[$storeKey] = $this->serialize($value);
+        }
+        if ($payload === []) {
+            return [];
+        }
+
+        $written = $this->ops->mset($payload, \max(0, $ttl));
+        $result = [];
+        foreach ($storeKeys as $key => $storeKey) {
+            $result[$key] = $written[$storeKey] ?? false;
         }
         return $result;
     }
@@ -315,9 +346,54 @@ final class ObjectCache
      */
     public function get_multiple(array $keys, string $group = 'default', bool $force = false): array
     {
+        if ($group === '') {
+            $group = 'default';
+        }
+        if ($this->isNonPersistent($group) || !$this->ops instanceof BatchKvOpsInterface) {
+            $result = [];
+            foreach ($keys as $key) {
+                $result[$key] = $this->get($key, $group, $force);
+            }
+            return $result;
+        }
+
+        // Batch path: identical per-key semantics to get() — runtime array
+        // first (unless $force), store on a miss, hydrate the runtime array —
+        // but every store miss is fetched with ONE mget (a single call into
+        // the store on ePHPm >= v0.13.0) instead of one get() per key.
         $result = [];
+        /** @var array<string, int|string> $pending skey => original key */
+        $pending = [];
         foreach ($keys as $key) {
-            $result[$key] = $this->get($key, $group, $force);
+            $skey = (string) $key;
+            if (!$force && isset($this->cache[$group]) && \array_key_exists($skey, $this->cache[$group])) {
+                $value = $this->cache[$group][$skey];
+                $result[$key] = \is_object($value) ? clone $value : $value;
+                continue;
+            }
+            // Placeholder keeps the caller's key order; filled below on a hit.
+            $result[$key] = false;
+            $pending[$skey] = $key;
+        }
+        if ($pending === []) {
+            return $result;
+        }
+
+        $storeKeys = [];
+        foreach ($pending as $key) {
+            $storeKeys[] = $this->build_key($key, $group);
+        }
+        $raws = $this->ops->mget($storeKeys);
+
+        $i = 0;
+        foreach ($pending as $skey => $key) {
+            $raw = $raws[$i++] ?? null;
+            if ($raw === null) {
+                continue;
+            }
+            $value = $this->unserialize($raw);
+            $this->cache[$group][(string) $skey] = $value;
+            $result[$key] = \is_object($value) ? clone $value : $value;
         }
         return $result;
     }
@@ -426,9 +502,13 @@ final class ObjectCache
     /**
      * Best-effort flush of a single group.
      *
-     * The KV SAPI offers no key-enumeration or prefix-scan primitive, so a
+     * The KV SAPI offers no complete key-enumeration primitive, so a
      * persistent group cannot be selectively cleared without tracking every
-     * key we've written. We therefore clear the group from the runtime
+     * key we've written. (ePHPm v0.13.0 adds `ephpm_kv_scan()`, but in a
+     * cluster it lists only the local node's keyspace — string values above
+     * the cluster's small-value threshold live only on their replica nodes —
+     * so a scan-based flush would silently miss keys. It is deliberately not
+     * used here.) We therefore clear the group from the runtime
      * array (always possible) and report success only for non-persistent
      * groups, where the runtime array IS the whole story. For persistent
      * groups this returns false to stay honest: the in-store entries

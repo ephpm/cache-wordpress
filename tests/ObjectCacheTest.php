@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ephpm\Cache\WordPress\Tests;
 
+use Ephpm\Cache\WordPress\BatchKvOpsInterface;
 use Ephpm\Cache\WordPress\InMemoryKvOps;
 use Ephpm\Cache\WordPress\KvOpsInterface;
 use Ephpm\Cache\WordPress\ObjectCache;
@@ -191,6 +192,137 @@ final class ObjectCacheTest extends TestCase
         self::assertSame([3], $got['c']);
     }
 
+    public function test_get_multiple_batches_store_misses_into_one_mget(): void
+    {
+        $spy = new SpyBatchKvOps();
+        $writer = new ObjectCache($spy);
+        $writer->set('a', 1);
+        $writer->set('b', ['two']);
+
+        // A fresh instance (= a new request) with one runtime hit.
+        $cache = new ObjectCache($spy);
+        $cache->set('local', 'runtime');
+        $spy->calls = [];
+
+        $got = $cache->get_multiple(['b', 'local', 'missing', 'a']);
+        self::assertSame(['b', 'local', 'missing', 'a'], \array_keys($got));
+        self::assertSame(['two'], $got['b']);
+        self::assertSame('runtime', $got['local']);
+        self::assertFalse($got['missing']);
+        self::assertSame(1, $got['a']);
+        // Only the runtime misses reach the store, in one call.
+        self::assertSame(['mget'], $spy->calls);
+        self::assertSame(
+            [$cache->build_key('b'), $cache->build_key('missing'), $cache->build_key('a')],
+            $spy->lastMgetKeys,
+        );
+
+        // Hits were hydrated into the runtime array: no further store call.
+        $spy->calls = [];
+        self::assertSame(['two'], $cache->get('b'));
+        self::assertSame([1, ['two']], \array_values($cache->get_multiple(['a', 'b'])));
+        self::assertSame([], $spy->calls);
+    }
+
+    public function test_get_multiple_force_rereads_every_key_from_store(): void
+    {
+        $spy = new SpyBatchKvOps();
+        $cache = new ObjectCache($spy);
+        $cache->set('k', 'v');
+        $spy->calls = [];
+
+        self::assertSame(['k' => 'v'], $cache->get_multiple(['k'], 'default', true));
+        self::assertSame(['mget'], $spy->calls);
+    }
+
+    public function test_get_multiple_without_batch_backend_uses_per_key_get(): void
+    {
+        $spy = new SpyKvOps();
+        $cache = new ObjectCache($spy);
+        $cache->set('a', 'x');
+        $cache->flush_runtime();
+        $spy->calls = [];
+
+        self::assertSame(['a' => 'x', 'b' => false], $cache->get_multiple(['a', 'b']));
+        self::assertSame(['get', 'get'], $spy->calls);
+    }
+
+    public function test_get_multiple_returns_clones_of_objects(): void
+    {
+        $cache = new ObjectCache(new InMemoryKvOps());
+        $cache->set('o', (object) ['n' => 1]);
+        $cache->flush_runtime();
+
+        $first = $cache->get_multiple(['o'])['o'];
+        $first->n = 99;
+        self::assertSame(1, $cache->get('o')->n);
+    }
+
+    public function test_set_multiple_writes_in_one_mset_with_shared_ttl(): void
+    {
+        $spy = new SpyBatchKvOps();
+        $cache = new ObjectCache($spy);
+
+        $result = $cache->set_multiple(['a' => 1, 'b' => 'two'], 'posts', 60);
+        self::assertSame(['a' => true, 'b' => true], $result);
+        self::assertSame(['mset'], $spy->calls);
+        self::assertSame(60, $spy->ttl($cache->build_key('a', 'posts')));
+        self::assertSame(60, $spy->ttl($cache->build_key('b', 'posts')));
+
+        // Runtime write-through, exactly like set().
+        $spy->calls = [];
+        self::assertSame('two', $cache->get('b', 'posts'));
+        self::assertSame([], $spy->calls);
+        // And the stored encoding matches set()'s (int stays incr-able).
+        self::assertSame(1, $cache->get('a', 'posts', true));
+    }
+
+    public function test_set_multiple_reports_a_refused_key(): void
+    {
+        $spy = new SpyBatchKvOps();
+        $spy->refuse = ['wp:1:default:b' => true];
+        $cache = new ObjectCache($spy);
+
+        self::assertSame(
+            ['a' => true, 'b' => false],
+            $cache->set_multiple(['a' => 'x', 'b' => 'y']),
+        );
+    }
+
+    public function test_set_multiple_without_batch_backend_uses_per_key_set(): void
+    {
+        $spy = new SpyKvOps();
+        $cache = new ObjectCache($spy);
+        self::assertSame(['a' => true, 'b' => true], $cache->set_multiple(['a' => 1, 'b' => 2]));
+        self::assertSame(['set', 'set'], $spy->calls);
+    }
+
+    public function test_add_multiple_stays_per_key_setnx_on_batch_backend(): void
+    {
+        // mset cannot do "only if absent", so add_multiple must keep using
+        // the atomic per-key setnx even when a batch backend is available.
+        $spy = new SpyBatchKvOps();
+        $cache = new ObjectCache($spy);
+        $cache->set('y', 'existing');
+        $cache->flush_runtime();
+        $spy->calls = [];
+
+        self::assertSame(['x' => true, 'y' => false], $cache->add_multiple(['x' => 1, 'y' => 2]));
+        self::assertSame(['setnx', 'setnx'], $spy->calls);
+        self::assertSame('existing', $cache->get('y', 'default', true));
+    }
+
+    public function test_batch_calls_on_non_persistent_group_never_touch_backend(): void
+    {
+        $spy = new SpyBatchKvOps();
+        $cache = new ObjectCache($spy);
+        $cache->add_non_persistent_groups('counts');
+
+        self::assertSame(['a' => true], $cache->set_multiple(['a' => 1], 'counts'));
+        self::assertSame(['a' => 1, 'b' => false], $cache->get_multiple(['a', 'b'], 'counts', true));
+        self::assertSame([], $spy->calls);
+    }
+
     public function test_add_multiple_and_delete_multiple(): void
     {
         $cache = new ObjectCache(new InMemoryKvOps());
@@ -329,8 +461,107 @@ final class ObjectCacheTest extends TestCase
 }
 
 /**
+ * Spy over a batch-capable backend: records calls like SpyKvOps, plus the
+ * mget/mset batch methods. Keys listed in $refuse are rejected by writes.
+ */
+final class SpyBatchKvOps implements BatchKvOpsInterface
+{
+    /** @var array<int, string> */
+    public array $calls = [];
+
+    /** @var list<string> */
+    public array $lastMgetKeys = [];
+
+    /** @var array<string, bool> */
+    public array $refuse = [];
+
+    private InMemoryKvOps $inner;
+
+    public function __construct()
+    {
+        $this->inner = new InMemoryKvOps();
+    }
+
+    public function get(string $key): ?string
+    {
+        $this->calls[] = 'get';
+        return $this->inner->get($key);
+    }
+
+    public function set(string $key, string $value, int $ttlSeconds = 0): bool
+    {
+        $this->calls[] = 'set';
+        return !isset($this->refuse[$key]) && $this->inner->set($key, $value, $ttlSeconds);
+    }
+
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool
+    {
+        $this->calls[] = 'setnx';
+        return $this->inner->setnx($key, $value, $ttlSeconds);
+    }
+
+    public function del(string $key): int
+    {
+        $this->calls[] = 'del';
+        return $this->inner->del($key);
+    }
+
+    public function exists(string $key): bool
+    {
+        $this->calls[] = 'exists';
+        return $this->inner->exists($key);
+    }
+
+    public function incrBy(string $key, int $delta): int
+    {
+        $this->calls[] = 'incrBy';
+        return $this->inner->incrBy($key, $delta);
+    }
+
+    public function expire(string $key, int $ttlSeconds): bool
+    {
+        $this->calls[] = 'expire';
+        return $this->inner->expire($key, $ttlSeconds);
+    }
+
+    public function ttl(string $key): int
+    {
+        return $this->inner->ttl($key);
+    }
+
+    public function pttl(string $key): int
+    {
+        return $this->inner->pttl($key);
+    }
+
+    public function flush(): bool
+    {
+        $this->calls[] = 'flush';
+        return $this->inner->flush();
+    }
+
+    public function mget(array $keys): array
+    {
+        $this->calls[] = 'mget';
+        $this->lastMgetKeys = $keys;
+        return $this->inner->mget($keys);
+    }
+
+    public function mset(array $values, int $ttlSeconds = 0): array
+    {
+        $this->calls[] = 'mset';
+        $out = [];
+        foreach ($values as $key => $value) {
+            $out[$key] = !isset($this->refuse[$key]) && $this->inner->set($key, $value, $ttlSeconds);
+        }
+        return $out;
+    }
+}
+
+/**
  * Spy backend that records every method invoked so tests can assert which
- * (if any) calls reach the KV store.
+ * (if any) calls reach the KV store. Implements only the base interface, so
+ * it also exercises ObjectCache's per-key fallback for batch operations.
  */
 final class SpyKvOps implements KvOpsInterface
 {

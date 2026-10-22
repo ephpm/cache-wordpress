@@ -9,9 +9,17 @@ namespace Ephpm\Cache\WordPress;
  * the ePHPm SAPI. Refuses to construct if those functions aren't present
  * so we fail fast outside the runtime instead of producing
  * "Call to undefined function" errors at request time.
+ *
+ * The batch methods use `ephpm_kv_mget()` / `ephpm_kv_mset()` when the
+ * runtime has them (ePHPm >= v0.13.0) and fall back to one call per key
+ * otherwise, so the drop-in keeps working on older runtimes.
  */
-final class SapiKvOps implements KvOpsInterface
+final class SapiKvOps implements BatchKvOpsInterface
 {
+    private bool $hasMget;
+
+    private bool $hasMset;
+
     public function __construct()
     {
         if (!\function_exists('ephpm_kv_get')) {
@@ -21,6 +29,8 @@ final class SapiKvOps implements KvOpsInterface
                 . 'use Ephpm\\Cache\\WordPress\\InMemoryKvOps in tests.'
             );
         }
+        $this->hasMget = \function_exists('ephpm_kv_mget');
+        $this->hasMset = \function_exists('ephpm_kv_mset');
     }
 
     public function get(string $key): ?string
@@ -88,5 +98,45 @@ final class SapiKvOps implements KvOpsInterface
             return false;
         }
         return (bool) \ephpm_kv_flush_all();
+    }
+
+    public function mget(array $keys): array
+    {
+        if ($keys === []) {
+            return [];
+        }
+        if ($this->hasMget) {
+            $values = \ephpm_kv_mget($keys);
+            // false = the batch as a whole failed (e.g. one non-UTF-8 key).
+            // Re-read key by key so one bad key misses alone, exactly as
+            // the per-key path would, instead of failing the whole batch.
+            if (\is_array($values) && \count($values) === \count($keys)) {
+                /** @var list<string|null> */
+                return \array_values($values);
+            }
+        }
+        $out = [];
+        foreach ($keys as $key) {
+            $out[] = $this->get($key);
+        }
+        return $out;
+    }
+
+    public function mset(array $values, int $ttlSeconds = 0): array
+    {
+        if ($values === []) {
+            return [];
+        }
+        // mset stores every key or reports false with an unknown prefix
+        // already written. Writes are idempotent, so on false we redo them
+        // one by one to learn (and report) exactly which keys landed.
+        if ($this->hasMset && \ephpm_kv_mset($values, $ttlSeconds) === true) {
+            return \array_fill_keys(\array_keys($values), true);
+        }
+        $out = [];
+        foreach ($values as $key => $value) {
+            $out[(string) $key] = $this->set((string) $key, $value, $ttlSeconds);
+        }
+        return $out;
     }
 }
