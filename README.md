@@ -53,6 +53,8 @@ rather than being a documented no-op.
 - **The ePHPm runtime, v0.1.2 or newer** (current release: v0.10.2). The
   `ephpm_kv_*` SAPI functions have shipped since ePHPm v0.1.0, but
   `ephpm_kv_flush_all()` — which backs `wp_cache_flush()` — arrived in v0.1.2.
+  ePHPm v0.13.0 or newer additionally batches `wp_cache_get_multiple()` /
+  `wp_cache_set_multiple()` (optional; older runtimes use one call per key).
   The functions are registered
   by ePHPm's embedded PHP. If you run WordPress under PHP-FPM, Apache mod_php, or
   the stock PHP CLI, those functions don't exist and `SapiKvOps::__construct()`
@@ -136,7 +138,7 @@ delegating to the `ObjectCache` engine:
 |--------------------------------------------------------|--------------------|
 | `wp_cache_get`, `wp_cache_set`, `wp_cache_add`, `wp_cache_replace` | yes (`add` is atomic via `ephpm_kv_setnx`) |
 | `wp_cache_delete`                                      | yes                |
-| `wp_cache_get_multiple`, `wp_cache_set_multiple`, `wp_cache_add_multiple`, `wp_cache_delete_multiple` | yes |
+| `wp_cache_get_multiple`, `wp_cache_set_multiple`, `wp_cache_add_multiple`, `wp_cache_delete_multiple` | yes (`get`/`set_multiple` batched on ePHPm v0.13.0+ — see below) |
 | `wp_cache_incr`, `wp_cache_decr`                       | yes (atomic via `ephpm_kv_incr_by`; miss returns `false`, per WP core) |
 | `wp_cache_flush`                                       | **yes — clears the whole store** |
 | `wp_cache_flush_runtime`                               | yes (runtime array only) |
@@ -151,18 +153,40 @@ delegating to the `ObjectCache` engine:
 `get_multiple`, `delete_multiple`, and `flush_runtime`, so core and well-behaved
 plugins take their batched/fast paths. It returns `false` for `flush_group`:
 the persistent tier cannot be selectively flushed (the KV SAPI has no
-key-enumeration primitive), so advertising it would over-promise — see the
+cluster-complete key-enumeration primitive), so advertising it would over-promise — see the
 [`wp_cache_flush_group()` limitation](#wp_cache_flush_group-limitation) below.
 
 Like core's own `WP_Object_Cache`, every value set during a request is served
 back from an in-request runtime array for the rest of that request; the KV store
 is consulted only on a runtime miss (or with `$force = true`).
 
+### Batched multi-key calls (ePHPm v0.13.0+)
+
+On ePHPm v0.13.0 or newer, `wp_cache_get_multiple()` fetches every runtime miss
+with one `ephpm_kv_mget()` call, and `wp_cache_set_multiple()` writes the whole
+batch with one `ephpm_kv_mset()` call — one trip into the store instead of one
+per key. The runtime-array behaviour is unchanged (hits are still served from
+memory, misses still hydrate it, `$force` still re-reads the store), and the
+return values are the same per-key arrays as before. If a batch write is
+refused (e.g. the KV memory limit), the keys are re-written one at a time so
+each key's `true`/`false` stays accurate.
+
+Both functions are feature-detected with `function_exists()`; on older ePHPm
+the drop-in uses one `ephpm_kv_get()` / `ephpm_kv_set()` per key, exactly as
+before. `wp_cache_add_multiple()` is deliberately **not** batched: `mset` cannot
+do "only if absent", so each key still goes through the atomic
+`ephpm_kv_setnx()`. `wp_cache_delete_multiple()` stays per key (there is no
+multi-key delete function).
+
 ### `wp_cache_flush_group()` limitation
 
-The KV SAPI offers no key-enumeration or prefix-scan primitive, so a *persistent*
+The KV SAPI offers no complete key-enumeration primitive, so a *persistent*
 group cannot be selectively dropped from the store without tracking every key
-ever written to it. `flush_group()` therefore:
+ever written to it. (ePHPm v0.13.0 adds `ephpm_kv_scan()`, but in a cluster it
+lists only the local node's keyspace — string values above the cluster's
+small-value threshold live only on their replica nodes — so a scan-based group
+flush would silently leave keys behind. This package does not use it.)
+`flush_group()` therefore:
 
 - always clears that group from the **runtime** array, and
 - returns `true` only for **non-persistent** groups (where the runtime array is
@@ -266,6 +290,10 @@ $cache->set('foo', 'bar', 'default', 60);
 assert($cache->get('foo', 'default') === 'bar');
 ```
 
+A custom backend only needs `KvOpsInterface`; implementing the optional
+`BatchKvOpsInterface` (`mget` / `mset`) as well lets `get_multiple()` /
+`set_multiple()` batch, otherwise they fall back to one call per key.
+
 `InMemoryKvOps` is for tests only — values live in PHP arrays, there is no
 eviction policy, no memory limit, and TTL is best-effort lazy expiry. Don't use
 it in production.
@@ -323,7 +351,8 @@ ePHPm runs PHP inside the same OS process as the KV store via the embed SAPI. Th
 store itself is a Rust [`DashMap`](https://docs.rs/dashmap/) plus TTL management.
 ePHPm registers a small set of host functions (`ephpm_kv_get`, `ephpm_kv_set`,
 `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`,
-`ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_setnx`, `ephpm_kv_flush_all`) into
+`ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_setnx`, `ephpm_kv_flush_all`, and
+on v0.13.0+ `ephpm_kv_mget` / `ephpm_kv_mset`) into
 PHP's global function table. Calling one is a direct C function call into Rust — no socket, no
 protocol parser, no value serialization beyond what userland code already does.
 
