@@ -76,11 +76,11 @@ If you get `false`, you're not running inside ePHPm.
 
 ePHPm packages are distributed via their GitHub repositories, not Packagist.
 Add this repo as a Composer `vcs` repository, then require the package
-(`ephpm/cache-wordpress` is tagged `v0.1.0`, so `^0.1` resolves):
+(`ephpm/cache-wordpress` is tagged `v0.2.0`, so `^0.2` resolves):
 
 ```bash
 composer config repositories.ephpm/cache-wordpress vcs https://github.com/ephpm/cache-wordpress
-composer require ephpm/cache-wordpress:^0.1
+composer require ephpm/cache-wordpress:^0.2
 ```
 
 Then activate the drop-in by copying it into `wp-content/`:
