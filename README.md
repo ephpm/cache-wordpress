@@ -50,7 +50,7 @@ rather than being a documented no-op.
   This package does **not** depend on any WordPress core Composer package — it
   implements the `WP_Object_Cache` surface WordPress calls, and runs its tests
   on plain `php-cli`.
-- **The ePHPm runtime, v0.1.2 or newer** (current release: v0.10.2). The
+- **The ePHPm runtime, v0.1.2 or newer** (see the [ePHPm releases](https://github.com/ephpm/ephpm/releases) for the latest version). The
   `ephpm_kv_*` SAPI functions have shipped since ePHPm v0.1.0, but
   `ephpm_kv_flush_all()` — which backs `wp_cache_flush()` — arrived in v0.1.2.
   ePHPm v0.13.0 or newer additionally batches `wp_cache_get_multiple()` /
